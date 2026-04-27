@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Read crate metadata
+        id: crate
+        run: |
+          metadata=$(nix develop -c cargo metadata --no-deps --format-version 1)
+          name=$(jq -r '.packages[] | select(.name == "akuna-embed") | .name' <<< "$metadata")
+          version=$(jq -r '.packages[] | select(.name == "akuna-embed") | .version' <<< "$metadata")
+
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check crates.io version
+        id: crates_io
+        run: |
+          encoded_name=$(jq -rn --arg value '${{ steps.crate.outputs.name }}' '$value|@uri')
+          response_file=$(mktemp)
+          status=$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+            --user-agent "akuna-embed-release-workflow (https://github.com/akunasoftware/akuna-embed)" \
+            "https://crates.io/api/v1/crates/$encoded_name")
+
+          if [ "$status" = "404" ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$status" != "200" ]; then
+            cat "$response_file"
+            exit 1
+          fi
+
+          published=$(jq -r --arg version '${{ steps.crate.outputs.version }}' \
+            'any(.versions[]?; .num == $version)' "$response_file")
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+
+      - name: Check GitHub release
+        id: github_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.crate.outputs.tag }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+
+      - name: Dry-run publish crate
+        if: ${{ steps.crates_io.outputs.published != 'true' }}
+        run: nix develop -c cargo publish --dry-run
+
+      - name: Publish crate
+        if: ${{ steps.crates_io.outputs.published != 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: nix develop -c cargo publish
+
+      - name: Create GitHub release
+        if: ${{ steps.github_release.outputs.exists != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.crate.outputs.tag }}
+          VERSION: ${{ steps.crate.outputs.version }}
+        run: |
+          gh release create "$TAG" \
+            --target '${{ github.event.workflow_run.head_sha }}' \
+            --title "$TAG" \
+            --notes "Published $VERSION to crates.io."

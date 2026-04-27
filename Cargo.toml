@@ -1,0 +1,23 @@
+[package]
+name = "akuna-embed"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Simple text embedding models built with Burn"
+repository = "https://github.com/akunasoftware/akuna-embed"
+homepage = "https://github.com/akunasoftware/akuna-embed"
+documentation = "https://docs.rs/akuna-embed"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.102"
+burn = "0.21.0-pre.3"
+burn-wgpu = { version = "0.21.0-pre.3", default-features = false, features = ["std", "webgpu"] }
+burn-store = { version = "0.21.0-pre.3", features = ["std", "safetensors"] }
+hf-hub = "0.5.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokenizers = "0.22.2"
+
+[dev-dependencies]
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "sync"] }
