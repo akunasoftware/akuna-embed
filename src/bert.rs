@@ -25,9 +25,7 @@ const MINILM_L6_REPO_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
 const MINILM_L12_REPO_ID: &str = "sentence-transformers/all-MiniLM-L12-v2";
 const BGE_SMALL_EN_V15_REPO_ID: &str = "BAAI/bge-small-en-v1.5";
 const BGE_BASE_EN_V15_REPO_ID: &str = "BAAI/bge-base-en-v1.5";
-const BGE_QUERY_PROMPT: &str =
-    "Represent this sentence for searching relevant passages: ";
-
+const BGE_LARGE_EN_V15_REPO_ID: &str = "BAAI/bge-large-en-v1.5";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum BertEmbeddingVariant {
     MiniLmL6,
@@ -35,6 +33,7 @@ pub(crate) enum BertEmbeddingVariant {
     MiniLmL12,
     BgeSmallEnV15,
     BgeBaseEnV15,
+    BgeLargeEnV15,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +43,7 @@ pub(crate) enum EmbeddingInputKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PoolingStrategy {
+pub(crate) enum PoolingStrategy {
     Mean,
     Cls,
 }
@@ -52,7 +51,6 @@ enum PoolingStrategy {
 struct BertEmbeddingMetadata {
     repo_id: &'static str,
     pooling_strategy: PoolingStrategy,
-    query_prompt: Option<&'static str>,
 }
 
 impl BertEmbeddingVariant {
@@ -64,31 +62,27 @@ impl BertEmbeddingVariant {
         self.metadata().pooling_strategy
     }
 
-    fn query_prompt(self) -> Option<&'static str> {
-        self.metadata().query_prompt
-    }
-
     fn metadata(self) -> BertEmbeddingMetadata {
         match self {
             Self::MiniLmL6 => BertEmbeddingMetadata {
                 repo_id: MINILM_L6_REPO_ID,
                 pooling_strategy: PoolingStrategy::Mean,
-                query_prompt: None,
             },
             Self::MiniLmL12 => BertEmbeddingMetadata {
                 repo_id: MINILM_L12_REPO_ID,
                 pooling_strategy: PoolingStrategy::Mean,
-                query_prompt: None,
             },
             Self::BgeSmallEnV15 => BertEmbeddingMetadata {
                 repo_id: BGE_SMALL_EN_V15_REPO_ID,
                 pooling_strategy: PoolingStrategy::Cls,
-                query_prompt: Some(BGE_QUERY_PROMPT),
             },
             Self::BgeBaseEnV15 => BertEmbeddingMetadata {
                 repo_id: BGE_BASE_EN_V15_REPO_ID,
                 pooling_strategy: PoolingStrategy::Cls,
-                query_prompt: Some(BGE_QUERY_PROMPT),
+            },
+            Self::BgeLargeEnV15 => BertEmbeddingMetadata {
+                repo_id: BGE_LARGE_EN_V15_REPO_ID,
+                pooling_strategy: PoolingStrategy::Cls,
             },
         }
     }
@@ -99,6 +93,7 @@ pub(crate) struct HfModelFiles {
     pub(crate) config_path: PathBuf,
     pub(crate) weights_path: PathBuf,
     pub(crate) tokenizer_path: PathBuf,
+    pub(crate) sentence_bert_config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +106,34 @@ struct BertConfig {
     max_position_embeddings: usize,
     type_vocab_size: usize,
     layer_norm_eps: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SentenceBertConfig {
+    max_seq_length: Option<usize>,
+}
+
+impl SentenceBertConfig {
+    pub(crate) fn load_from_hf(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "failed to read sentence-transformers config at {}",
+                path.display()
+            )
+        })?;
+
+        serde_json::from_str(&content).with_context(|| {
+            format!(
+                "failed to parse sentence-transformers config at {}",
+                path.display()
+            )
+        })
+    }
+
+    pub(crate) fn max_seq_length(&self) -> Option<usize> {
+        self.max_seq_length
+    }
 }
 
 #[derive(Debug)]
@@ -259,10 +282,11 @@ where
     pub(crate) fn encode(
         &self,
         sentences: &[&str],
-        input_kind: EmbeddingInputKind,
+        _input_kind: EmbeddingInputKind,
+        prompt: Option<&str>,
         device: &B::Device,
     ) -> Result<Tensor<B, 2>> {
-        let prompted_sentences = self.prompt_sentences(sentences, input_kind);
+        let prompted_sentences = prompt_sentences(sentences, prompt);
         let prompted_sentence_refs = prompted_sentences
             .iter()
             .map(Cow::as_ref)
@@ -284,25 +308,20 @@ where
 
         Ok(normalize_l2(embeddings))
     }
+}
 
-    fn prompt_sentences<'a>(
-        &self,
-        sentences: &[&'a str],
-        input_kind: EmbeddingInputKind,
-    ) -> Vec<Cow<'a, str>> {
-        let prompt = match input_kind {
-            EmbeddingInputKind::Query => self.variant.query_prompt(),
-            EmbeddingInputKind::Document => None,
-        };
-
-        sentences
-            .iter()
-            .map(|sentence| match prompt {
-                Some(prompt) => Cow::Owned(format!("{prompt}{sentence}")),
-                None => Cow::Borrowed(*sentence),
-            })
-            .collect()
-    }
+pub(crate) fn prompt_sentences<'a>(
+    sentences: &[&'a str],
+    prompt: Option<&str>,
+) -> Vec<Cow<'a, str>> {
+    // SentenceTransformers strips input strings before tokenization.
+    sentences
+        .iter()
+        .map(|sentence| match prompt {
+            Some(prompt) => Cow::Owned(format!("{prompt}{}", sentence.trim())),
+            None => Cow::Borrowed(sentence.trim()),
+        })
+        .collect()
 }
 
 pub(crate) async fn load_pretrained_bert_embedding<B>(
@@ -313,7 +332,7 @@ pub(crate) async fn load_pretrained_bert_embedding<B>(
 where
     B: Backend,
 {
-    let files = download_hf_model(variant, cache_dir).await?;
+    let files = download_hf_model(variant.repo_id(), cache_dir).await?;
     let config = BertConfig::load_from_hf(&files.config_path)?;
     let mut model = config.init(device);
     load_pretrained_weights(&mut model, &files.weights_path)?;
@@ -325,9 +344,14 @@ where
                 files.tokenizer_path.display()
             )
         })?;
+    let max_length = sentence_transformers_max_length(
+        files.sentence_bert_config_path.as_deref(),
+    )?
+    .unwrap_or(config.max_position_embeddings)
+    .min(config.max_position_embeddings);
     tokenizer
         .with_truncation(Some(TruncationParams {
-            max_length: config.max_position_embeddings,
+            max_length,
             ..Default::default()
         }))
         .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -341,7 +365,16 @@ where
 }
 
 pub(crate) async fn download_hf_model(
-    variant: BertEmbeddingVariant,
+    repo_id: &str,
+    cache_dir: Option<PathBuf>,
+) -> Result<HfModelFiles> {
+    download_hf_model_with_weights(repo_id, "model.safetensors", cache_dir)
+        .await
+}
+
+pub(crate) async fn download_hf_model_with_weights(
+    repo_id: &str,
+    weights_file: &str,
     cache_dir: Option<PathBuf>,
 ) -> Result<HfModelFiles> {
     let mut builder = ApiBuilder::new().with_progress(true);
@@ -352,31 +385,35 @@ pub(crate) async fn download_hf_model(
     let api = builder
         .build()
         .context("failed to initialize Hugging Face API for embedding model")?;
-    let repo = api.model(variant.repo_id().to_string());
+    let repo = api.model(repo_id.to_string());
 
     let config_path = repo.get("config.json").await.with_context(|| {
-        format!("failed to fetch embedding config for {}", variant.repo_id())
+        format!("failed to fetch embedding config for {repo_id}")
     })?;
-    let weights_path =
-        repo.get("model.safetensors").await.with_context(|| {
-            format!(
-                "failed to fetch embedding weights for {}",
-                variant.repo_id()
-            )
-        })?;
+    let weights_path = repo.get(weights_file).await.with_context(|| {
+        format!("failed to fetch embedding weights for {repo_id}")
+    })?;
     let tokenizer_path =
         repo.get("tokenizer.json").await.with_context(|| {
-            format!(
-                "failed to fetch embedding tokenizer for {}",
-                variant.repo_id()
-            )
+            format!("failed to fetch embedding tokenizer for {repo_id}")
         })?;
+    let sentence_bert_config_path =
+        repo.get("sentence_bert_config.json").await.ok();
 
     Ok(HfModelFiles {
         config_path,
         weights_path,
         tokenizer_path,
+        sentence_bert_config_path,
     })
+}
+
+pub(crate) fn sentence_transformers_max_length(
+    path: Option<&Path>,
+) -> Result<Option<usize>> {
+    path.map(SentenceBertConfig::load_from_hf)
+        .transpose()
+        .map(|config| config.and_then(|config| config.max_seq_length()))
 }
 
 fn load_pretrained_weights<B: Backend>(
@@ -413,7 +450,7 @@ fn load_pretrained_weights<B: Backend>(
     Ok(())
 }
 
-fn tokenize_batch<B: Backend>(
+pub(crate) fn tokenize_batch<B: Backend>(
     tokenizer: &Tokenizer,
     sentences: &[&str],
     device: &B::Device,
@@ -451,7 +488,7 @@ fn tokenize_batch<B: Backend>(
     Ok((input_ids, attention_mask))
 }
 
-fn mean_pooling<B: Backend>(
+pub(crate) fn mean_pooling<B: Backend>(
     hidden_states: Tensor<B, 3>,
     attention_mask: Tensor<B, 2>,
 ) -> Tensor<B, 2> {
@@ -489,7 +526,9 @@ fn cls_pooling<B: Backend>(hidden_states: Tensor<B, 3>) -> Tensor<B, 2> {
         .reshape([batch_size, hidden_size])
 }
 
-fn normalize_l2<B: Backend>(embeddings: Tensor<B, 2>) -> Tensor<B, 2> {
+pub(crate) fn normalize_l2<B: Backend>(
+    embeddings: Tensor<B, 2>,
+) -> Tensor<B, 2> {
     use burn::tensor::linalg::{Norm, vector_normalize};
 
     vector_normalize(embeddings, Norm::L2, 1, 1e-12)

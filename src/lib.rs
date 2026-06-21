@@ -24,6 +24,8 @@
 //! ```
 
 mod bert;
+mod mpnet;
+mod xlm_roberta;
 
 use std::path::PathBuf;
 
@@ -34,6 +36,13 @@ use burn_wgpu::{Wgpu, WgpuDevice};
 use crate::bert::{
     BertEmbeddingModel, BertEmbeddingVariant, EmbeddingInputKind,
     load_pretrained_bert_embedding,
+};
+use crate::mpnet::{
+    MpnetEmbeddingModel, MpnetEmbeddingVariant, load_pretrained_mpnet_embedding,
+};
+use crate::xlm_roberta::{
+    XlmRobertaEmbeddingModel, XlmRobertaEmbeddingVariant,
+    load_pretrained_xlm_roberta_embedding,
 };
 
 pub type DefaultBackend = Wgpu;
@@ -49,6 +58,13 @@ pub enum EmbeddingModel {
     MiniLmL12,
     BgeSmallEnV15,
     BgeBaseEnV15,
+    BgeLargeEnV15,
+    AllMpnetBaseV2,
+    /// BGE-M3 dense embeddings only.
+    ///
+    /// Sparse and multi-vector outputs are separate retrieval concerns and are
+    /// not exposed through this `Vec<f32>` dense embedding API.
+    BgeM3,
 }
 
 impl From<EmbeddingModel> for BertEmbeddingVariant {
@@ -60,8 +76,55 @@ impl From<EmbeddingModel> for BertEmbeddingVariant {
                 BertEmbeddingVariant::BgeSmallEnV15
             }
             EmbeddingModel::BgeBaseEnV15 => BertEmbeddingVariant::BgeBaseEnV15,
+            EmbeddingModel::BgeLargeEnV15 => {
+                BertEmbeddingVariant::BgeLargeEnV15
+            }
+            EmbeddingModel::AllMpnetBaseV2 | EmbeddingModel::BgeM3 => {
+                unreachable!("non-BERT models use their own loaders")
+            }
         }
     }
+}
+
+impl From<EmbeddingModel> for MpnetEmbeddingVariant {
+    fn from(value: EmbeddingModel) -> Self {
+        match value {
+            EmbeddingModel::AllMpnetBaseV2 => {
+                MpnetEmbeddingVariant::AllMpnetBaseV2
+            }
+            EmbeddingModel::MiniLmL6
+            | EmbeddingModel::MiniLmL12
+            | EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15
+            | EmbeddingModel::BgeM3 => {
+                unreachable!("non-MPNet models use their own loaders")
+            }
+        }
+    }
+}
+
+impl From<EmbeddingModel> for XlmRobertaEmbeddingVariant {
+    fn from(value: EmbeddingModel) -> Self {
+        match value {
+            EmbeddingModel::BgeM3 => XlmRobertaEmbeddingVariant::BgeM3,
+            EmbeddingModel::MiniLmL6
+            | EmbeddingModel::MiniLmL12
+            | EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15
+            | EmbeddingModel::AllMpnetBaseV2 => {
+                unreachable!("non-XLM-RoBERTa models use their own loaders")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LoadedEmbeddingModel<B: Backend> {
+    Bert(BertEmbeddingModel<B>),
+    Mpnet(MpnetEmbeddingModel<B>),
+    XlmRoberta(XlmRobertaEmbeddingModel<B>),
 }
 
 /// Options for [`TextEmbedding`].
@@ -76,7 +139,7 @@ pub struct TextEmbeddingOptions {
 /// Minimal text embedding interface inspired by `fastembed-rs`.
 #[derive(Debug)]
 pub struct TextEmbedding<B: Backend = DefaultBackend> {
-    model: BertEmbeddingModel<B>,
+    model: LoadedEmbeddingModel<B>,
     device: B::Device,
 }
 
@@ -97,12 +160,36 @@ where
         device: &B::Device,
         options: TextEmbeddingOptions,
     ) -> Result<Self> {
-        let model = load_pretrained_bert_embedding(
-            device,
-            options.model.into(),
-            options.cache_dir,
-        )
-        .await?;
+        let model = match options.model {
+            EmbeddingModel::MiniLmL6
+            | EmbeddingModel::MiniLmL12
+            | EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15 => LoadedEmbeddingModel::Bert(
+                load_pretrained_bert_embedding(
+                    device,
+                    options.model.into(),
+                    options.cache_dir,
+                )
+                .await?,
+            ),
+            EmbeddingModel::AllMpnetBaseV2 => LoadedEmbeddingModel::Mpnet(
+                load_pretrained_mpnet_embedding(
+                    device,
+                    options.model.into(),
+                    options.cache_dir,
+                )
+                .await?,
+            ),
+            EmbeddingModel::BgeM3 => LoadedEmbeddingModel::XlmRoberta(
+                load_pretrained_xlm_roberta_embedding(
+                    device,
+                    options.model.into(),
+                    options.cache_dir,
+                )
+                .await?,
+            ),
+        };
 
         Ok(Self {
             model,
@@ -112,24 +199,42 @@ where
 
     /// Embeds a single document and returns one embedding vector.
     pub fn embed(&self, document: impl AsRef<str>) -> Result<Vec<f32>> {
+        self.embed_with_prompt(document, None)
+    }
+
+    /// Embeds a single document with an optional input prompt.
+    pub fn embed_with_prompt(
+        &self,
+        document: impl AsRef<str>,
+        prompt: Option<&str>,
+    ) -> Result<Vec<f32>> {
         let document = document.as_ref();
         let documents = [document];
-        let mut embeddings = self.embed_batch(documents.as_slice(), None)?;
+        let mut embeddings =
+            self.embed_batch_with_prompt(documents.as_slice(), None, prompt)?;
         embeddings
             .pop()
             .context("expected one embedding for a single input document")
     }
 
-    /// Embeds a search query using any model-specific retrieval prompt.
-    ///
-    /// Some retrieval models train queries and documents with different text
-    /// prefixes. Use this when the text is the thing being searched for.
-    /// Use [`TextEmbedding::embed`] when the text is the content being indexed.
+    /// Embeds a search query using reference default behavior.
     pub fn embed_query(&self, query: impl AsRef<str>) -> Result<Vec<f32>> {
+        self.embed_query_with_prompt(query, None)
+    }
+
+    /// Embeds a search query with an optional input prompt.
+    pub fn embed_query_with_prompt(
+        &self,
+        query: impl AsRef<str>,
+        prompt: Option<&str>,
+    ) -> Result<Vec<f32>> {
         let query = query.as_ref();
         let queries = [query];
-        let mut embeddings =
-            self.embed_query_batch(queries.as_slice(), None)?;
+        let mut embeddings = self.embed_query_batch_with_prompt(
+            queries.as_slice(),
+            None,
+            prompt,
+        )?;
         embeddings
             .pop()
             .context("expected one embedding for a single input query")
@@ -141,26 +246,45 @@ where
         documents: &[S],
         batch_size: Option<usize>,
     ) -> Result<Vec<Vec<f32>>> {
+        self.embed_batch_with_prompt(documents, batch_size, None)
+    }
+
+    /// Embeds documents with an optional input prompt.
+    pub fn embed_batch_with_prompt<S: AsRef<str>>(
+        &self,
+        documents: &[S],
+        batch_size: Option<usize>,
+        prompt: Option<&str>,
+    ) -> Result<Vec<Vec<f32>>> {
         self.embed_batch_with_kind(
             documents,
             batch_size,
             EmbeddingInputKind::Document,
+            prompt,
         )
     }
 
-    /// Embeds search queries in batches using model-specific retrieval prompts.
-    ///
-    /// See [`TextEmbedding::embed_query`] for when query embeddings differ from
-    /// document embeddings.
+    /// Embeds search queries in batches using reference default behavior.
     pub fn embed_query_batch<S: AsRef<str>>(
         &self,
         queries: &[S],
         batch_size: Option<usize>,
     ) -> Result<Vec<Vec<f32>>> {
+        self.embed_query_batch_with_prompt(queries, batch_size, None)
+    }
+
+    /// Embeds search queries in batches with an optional input prompt.
+    pub fn embed_query_batch_with_prompt<S: AsRef<str>>(
+        &self,
+        queries: &[S],
+        batch_size: Option<usize>,
+        prompt: Option<&str>,
+    ) -> Result<Vec<Vec<f32>>> {
         self.embed_batch_with_kind(
             queries,
             batch_size,
             EmbeddingInputKind::Query,
+            prompt,
         )
     }
 
@@ -169,6 +293,7 @@ where
         inputs: &[S],
         batch_size: Option<usize>,
         input_kind: EmbeddingInputKind,
+        prompt: Option<&str>,
     ) -> Result<Vec<Vec<f32>>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
@@ -180,8 +305,26 @@ where
         for batch in inputs.chunks(batch_size) {
             let batch_inputs =
                 batch.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-            let batch_embeddings =
-                self.model.encode(&batch_inputs, input_kind, &self.device)?;
+            let batch_embeddings = match &self.model {
+                LoadedEmbeddingModel::Bert(model) => model.encode(
+                    &batch_inputs,
+                    input_kind,
+                    prompt,
+                    &self.device,
+                )?,
+                LoadedEmbeddingModel::Mpnet(model) => model.encode(
+                    &batch_inputs,
+                    input_kind,
+                    prompt,
+                    &self.device,
+                )?,
+                LoadedEmbeddingModel::XlmRoberta(model) => model.encode(
+                    &batch_inputs,
+                    input_kind,
+                    prompt,
+                    &self.device,
+                )?,
+            };
             embeddings.extend(tensor_to_rows(batch_embeddings)?);
         }
 
@@ -190,13 +333,28 @@ where
 
     /// Returns the loaded embedding checkpoint.
     pub fn model(&self) -> EmbeddingModel {
-        match self.model.variant {
-            BertEmbeddingVariant::MiniLmL6 => EmbeddingModel::MiniLmL6,
-            BertEmbeddingVariant::MiniLmL12 => EmbeddingModel::MiniLmL12,
-            BertEmbeddingVariant::BgeSmallEnV15 => {
-                EmbeddingModel::BgeSmallEnV15
-            }
-            BertEmbeddingVariant::BgeBaseEnV15 => EmbeddingModel::BgeBaseEnV15,
+        match &self.model {
+            LoadedEmbeddingModel::Bert(model) => match model.variant {
+                BertEmbeddingVariant::MiniLmL6 => EmbeddingModel::MiniLmL6,
+                BertEmbeddingVariant::MiniLmL12 => EmbeddingModel::MiniLmL12,
+                BertEmbeddingVariant::BgeSmallEnV15 => {
+                    EmbeddingModel::BgeSmallEnV15
+                }
+                BertEmbeddingVariant::BgeBaseEnV15 => {
+                    EmbeddingModel::BgeBaseEnV15
+                }
+                BertEmbeddingVariant::BgeLargeEnV15 => {
+                    EmbeddingModel::BgeLargeEnV15
+                }
+            },
+            LoadedEmbeddingModel::Mpnet(model) => match model.variant {
+                MpnetEmbeddingVariant::AllMpnetBaseV2 => {
+                    EmbeddingModel::AllMpnetBaseV2
+                }
+            },
+            LoadedEmbeddingModel::XlmRoberta(model) => match model.variant {
+                XlmRobertaEmbeddingVariant::BgeM3 => EmbeddingModel::BgeM3,
+            },
         }
     }
 }
@@ -240,6 +398,8 @@ mod tests {
     use tokio::sync::Mutex;
 
     static LIVE_MODEL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    const BGE_QUERY_PROMPT: &str =
+        "Represent this sentence for searching relevant passages: ";
 
     #[test]
     fn api_model_mapping_converts_all_public_variants() {
@@ -259,6 +419,18 @@ mod tests {
             BertEmbeddingVariant::from(EmbeddingModel::BgeBaseEnV15),
             BertEmbeddingVariant::BgeBaseEnV15
         );
+        assert_eq!(
+            BertEmbeddingVariant::from(EmbeddingModel::BgeLargeEnV15),
+            BertEmbeddingVariant::BgeLargeEnV15
+        );
+        assert_eq!(
+            MpnetEmbeddingVariant::from(EmbeddingModel::AllMpnetBaseV2),
+            MpnetEmbeddingVariant::AllMpnetBaseV2
+        );
+        assert_eq!(
+            XlmRobertaEmbeddingVariant::from(EmbeddingModel::BgeM3),
+            XlmRobertaEmbeddingVariant::BgeM3
+        );
     }
 
     #[test]
@@ -271,6 +443,15 @@ mod tests {
             BertEmbeddingVariant::BgeBaseEnV15.repo_id(),
             "BAAI/bge-base-en-v1.5"
         );
+        assert_eq!(
+            BertEmbeddingVariant::BgeLargeEnV15.repo_id(),
+            "BAAI/bge-large-en-v1.5"
+        );
+        assert_eq!(
+            MpnetEmbeddingVariant::AllMpnetBaseV2.repo_id(),
+            "sentence-transformers/all-mpnet-base-v2"
+        );
+        assert_eq!(XlmRobertaEmbeddingVariant::BgeM3.repo_id(), "BAAI/bge-m3");
     }
 
     #[test]
@@ -365,6 +546,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parity_bge_large_document_matches_sentence_transformers() {
+        assert_model_matches_sentence_transformers(
+            EmbeddingModel::BgeLargeEnV15,
+            "BAAI/bge-large-en-v1.5",
+            ReferenceInputKind::Document,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parity_bge_large_query_matches_sentence_transformers() {
+        assert_model_matches_sentence_transformers(
+            EmbeddingModel::BgeLargeEnV15,
+            "BAAI/bge-large-en-v1.5",
+            ReferenceInputKind::Query,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn parity_bge_small_document_matches_sentence_transformers() {
         assert_model_matches_sentence_transformers(
             EmbeddingModel::BgeSmallEnV15,
@@ -380,6 +581,18 @@ mod tests {
             EmbeddingModel::BgeSmallEnV15,
             "BAAI/bge-small-en-v1.5",
             ReferenceInputKind::Query,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parity_bge_small_query_with_prompt_matches_sentence_transformers()
+    {
+        assert_model_matches_sentence_transformers_with_prompt(
+            EmbeddingModel::BgeSmallEnV15,
+            "BAAI/bge-small-en-v1.5",
+            ReferenceInputKind::Query,
+            BGE_QUERY_PROMPT,
         )
         .await;
     }
@@ -419,6 +632,48 @@ mod tests {
         assert_model_matches_sentence_transformers(
             EmbeddingModel::MiniLmL6,
             "sentence-transformers/all-MiniLM-L6-v2",
+            ReferenceInputKind::Query,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parity_mpnet_base_document_matches_sentence_transformers() {
+        assert_model_matches_sentence_transformers(
+            EmbeddingModel::AllMpnetBaseV2,
+            "sentence-transformers/all-mpnet-base-v2",
+            ReferenceInputKind::Document,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parity_mpnet_base_query_matches_sentence_transformers() {
+        assert_model_matches_sentence_transformers(
+            EmbeddingModel::AllMpnetBaseV2,
+            "sentence-transformers/all-mpnet-base-v2",
+            ReferenceInputKind::Query,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "BGE-M3 is too large for the default WGPU parity suite"]
+    async fn parity_bge_m3_document_matches_sentence_transformers() {
+        assert_model_matches_sentence_transformers(
+            EmbeddingModel::BgeM3,
+            "BAAI/bge-m3",
+            ReferenceInputKind::Document,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "BGE-M3 is too large for the default WGPU parity suite"]
+    async fn parity_bge_m3_query_matches_sentence_transformers() {
+        assert_model_matches_sentence_transformers(
+            EmbeddingModel::BgeM3,
+            "BAAI/bge-m3",
             ReferenceInputKind::Query,
         )
         .await;
@@ -482,8 +737,62 @@ mod tests {
         input_kind: ReferenceInputKind,
     ) {
         let _guard = live_model_test_lock().lock().await;
-        let texts =
-            vec!["Hello world".to_string(), "Rust embeddings".to_string()];
+        assert_model_matches_sentence_transformers_for_texts(
+            model,
+            reference_model,
+            input_kind,
+            parity_texts(),
+        )
+        .await;
+        assert_model_matches_sentence_transformers_for_texts(
+            model,
+            reference_model,
+            input_kind,
+            long_parity_texts(),
+        )
+        .await;
+    }
+
+    async fn assert_model_matches_sentence_transformers_with_prompt(
+        model: EmbeddingModel,
+        reference_model: &str,
+        input_kind: ReferenceInputKind,
+        prompt: &str,
+    ) {
+        let _guard = live_model_test_lock().lock().await;
+        assert_model_matches_sentence_transformers_for_texts_with_prompt(
+            model,
+            reference_model,
+            input_kind,
+            parity_texts(),
+            Some(prompt),
+        )
+        .await;
+    }
+
+    async fn assert_model_matches_sentence_transformers_for_texts(
+        model: EmbeddingModel,
+        reference_model: &str,
+        input_kind: ReferenceInputKind,
+        texts: Vec<String>,
+    ) {
+        assert_model_matches_sentence_transformers_for_texts_with_prompt(
+            model,
+            reference_model,
+            input_kind,
+            texts,
+            None,
+        )
+        .await;
+    }
+
+    async fn assert_model_matches_sentence_transformers_for_texts_with_prompt(
+        model: EmbeddingModel,
+        reference_model: &str,
+        input_kind: ReferenceInputKind,
+        texts: Vec<String>,
+        prompt: Option<&str>,
+    ) {
         let model = TextEmbedding::new(TextEmbeddingOptions {
             model,
             ..Default::default()
@@ -492,17 +801,68 @@ mod tests {
         .expect("model should load");
         let actual = match input_kind {
             ReferenceInputKind::Document => model
-                .embed_batch(&texts, Some(2))
+                .embed_batch_with_prompt(&texts, Some(2), prompt)
                 .expect("Burn document embeddings should work"),
             ReferenceInputKind::Query => model
-                .embed_query_batch(&texts, Some(2))
+                .embed_query_batch_with_prompt(&texts, Some(2), prompt)
                 .expect("Burn query embeddings should work"),
         };
-        let expected =
-            reference_embeddings(reference_model, input_kind.as_str(), &texts)
-                .expect("reference embeddings should work");
+        let expected = reference_embeddings(
+            reference_model,
+            input_kind.as_str(),
+            &texts,
+            prompt,
+        )
+        .expect("reference embeddings should work");
 
-        assert_embedding_batches_close(&actual, &expected, 1e-3, 0.999);
+        assert_embedding_batches_close(
+            &actual,
+            &expected,
+            &texts,
+            model.model(),
+            input_kind,
+            max_delta_tolerance(model.model()),
+            0.999,
+        );
+    }
+
+    fn max_delta_tolerance(model: EmbeddingModel) -> f32 {
+        match model {
+            EmbeddingModel::BgeM3 => 1e-2,
+            EmbeddingModel::MiniLmL6
+            | EmbeddingModel::MiniLmL12
+            | EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15
+            | EmbeddingModel::AllMpnetBaseV2 => 1e-3,
+        }
+    }
+
+    fn parity_texts() -> Vec<String> {
+        vec![
+            "Hello world".to_string(),
+            "Rust embeddings".to_string(),
+            "Semantic search: fast, accurate, and simple.".to_string(),
+            "  padded input with leading and trailing spaces  ".to_string(),
+            "Numbers 12345, symbols !?., and mixed CASE.".to_string(),
+            "emoji rocket and unicode cafe".to_string(),
+        ]
+        .into_iter()
+        .chain(multilingual_parity_texts())
+        .collect()
+    }
+
+    fn multilingual_parity_texts() -> Vec<String> {
+        include_str!("../test-corpus/test-multilingual.txt")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn long_parity_texts() -> Vec<String> {
+        let sentence = "Burn embeddings should match sentence-transformers even when tokenizer truncation is required. ";
+        vec![sentence.repeat(128)]
     }
 
     fn live_model_test_lock() -> &'static Mutex<()> {
@@ -513,19 +873,25 @@ mod tests {
         model: &str,
         kind: &str,
         texts: &[String],
+        prompt: Option<&str>,
     ) -> Result<Vec<Vec<f32>>> {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
+        let mut args = vec![
+            "run",
+            "scripts/reference_embeddings.py",
+            "--model",
+            model,
+            "--kind",
+            kind,
+        ];
+        if let Some(prompt) = prompt {
+            args.extend(["--prompt", prompt]);
+        }
+
         let mut child = Command::new("uv")
-            .args([
-                "run",
-                "scripts/reference_embeddings.py",
-                "--model",
-                model,
-                "--kind",
-                kind,
-            ])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -560,12 +926,22 @@ mod tests {
     fn assert_embedding_batches_close(
         actual: &[Vec<f32>],
         expected: &[Vec<f32>],
+        texts: &[String],
+        model: EmbeddingModel,
+        input_kind: ReferenceInputKind,
         tolerance: f32,
         min_cosine_similarity: f32,
     ) {
         assert_eq!(actual.len(), expected.len());
-        for (actual, expected) in actual.iter().zip(expected) {
-            assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in
+            actual.iter().zip(expected).enumerate()
+        {
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "embedding width mismatch for {model:?} {input_kind:?} input {index}: {:?}",
+                texts.get(index)
+            );
             let max_delta = actual
                 .iter()
                 .zip(expected)
@@ -573,12 +949,14 @@ mod tests {
                 .fold(0.0f32, f32::max);
             assert!(
                 max_delta <= tolerance,
-                "max embedding delta {max_delta} exceeded tolerance {tolerance}"
+                "max embedding delta {max_delta} exceeded tolerance {tolerance} for {model:?} {input_kind:?} input {index}: {:?}",
+                texts.get(index)
             );
             let cosine_similarity = cosine_similarity(actual, expected);
             assert!(
                 cosine_similarity >= min_cosine_similarity,
-                "cosine similarity {cosine_similarity} fell below {min_cosine_similarity}"
+                "cosine similarity {cosine_similarity} fell below {min_cosine_similarity} for {model:?} {input_kind:?} input {index}: {:?}",
+                texts.get(index)
             );
         }
     }

@@ -1,0 +1,4 @@
+multilingual English Francais Espanol Deutsch
+semantic retrieval across English, 中文, 日本語, and العربية
+Japanese romaji nihongo semantic retrieval
+Arabic transliterated marhaba search text

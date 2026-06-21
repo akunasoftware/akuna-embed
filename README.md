@@ -54,8 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 When building search, embed stored content with `embed` or `embed_batch`.
 
 Embed user search text with `embed_query` or `embed_query_batch`.
-Some models, like BGE, use a special query prompt.
-This crate applies that prompt automatically.
+These methods follow `sentence-transformers` defaults and do not add hidden
+model-specific prompts.
+
+If a model card recommends a prompt, pass it explicitly with
+`embed_query_with_prompt` or `embed_query_batch_with_prompt`.
 
 ```rust
 use akuna_embed::TextEmbedding;
@@ -73,6 +76,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+```rust,no_run
+use akuna_embed::TextEmbedding;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model = TextEmbedding::new(Default::default()).await?;
+    let prompt = "Represent this sentence for searching relevant passages: ";
+
+    let query = model.embed_query_with_prompt(
+        "Rust machine learning",
+        Some(prompt),
+    )?;
+
+    assert!(!query.is_empty());
+
+    Ok(())
+}
+```
+
 ## Choose A Model
 
 `EmbeddingModel::MiniLmL12` is the default.
@@ -83,6 +105,13 @@ Available models:
 - `EmbeddingModel::MiniLmL6`
 - `EmbeddingModel::BgeSmallEnV15`
 - `EmbeddingModel::BgeBaseEnV15`
+- `EmbeddingModel::BgeLargeEnV15`
+- `EmbeddingModel::BgeM3`
+- `EmbeddingModel::AllMpnetBaseV2`
+
+`EmbeddingModel::BgeM3` exposes the dense embedding output only.
+Sparse and multi-vector BGE-M3 outputs are not part of this crate's simple
+`Vec<f32>` embedding API.
 
 ```rust,no_run
 use akuna_embed::{EmbeddingModel, TextEmbedding, TextEmbeddingOptions};
@@ -127,3 +156,11 @@ cargo nextest run
 
 Tests compare Rust output with Python `sentence-transformers` reference
 embeddings through `uv run scripts/reference_embeddings.py`.
+
+BGE-M3 parity tests are ignored by default because the model is large enough to
+exhaust WGPU memory in the full live suite.
+Run them explicitly with:
+
+```sh
+cargo test parity_bge_m3_ -- --ignored --nocapture --test-threads=1
+```

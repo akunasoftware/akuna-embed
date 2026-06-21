@@ -19,23 +19,32 @@ def main() -> None:
         choices=("document", "query"),
         default="document",
     )
+    parser.add_argument("--prompt", default=None)
     args = parser.parse_args()
 
     texts = json.load(sys.stdin)
     model = SentenceTransformer(args.model)
 
-    if args.kind == "query" and args.model.startswith("BAAI/bge-"):
-        prompt = "Represent this sentence for searching relevant passages: "
-        embeddings = model.encode(
-            [f"{prompt}{text}" for text in texts],
+    if args.prompt is None:
+        embeddings = model.encode(texts, normalize_embeddings=True)
+    elif args.kind == "query" and hasattr(model, "encode_query"):
+        embeddings = model.encode_query(
+            texts,
+            prompt=args.prompt,
             normalize_embeddings=True,
         )
-    elif args.kind == "query" and hasattr(model, "encode_query"):
-        embeddings = model.encode_query(texts, normalize_embeddings=True)
     elif args.kind == "document" and hasattr(model, "encode_document"):
-        embeddings = model.encode_document(texts, normalize_embeddings=True)
+        embeddings = model.encode_document(
+            texts,
+            prompt=args.prompt,
+            normalize_embeddings=True,
+        )
     else:
-        embeddings = model.encode(texts, normalize_embeddings=True)
+        embeddings = model.encode(
+            texts,
+            prompt=args.prompt,
+            normalize_embeddings=True,
+        )
 
     json.dump(embeddings.tolist(), sys.stdout)
 
